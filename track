@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+
+DB="${TRACK_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/track.json}"
+
+[[ ! -f "$DB" ]] && echo '{"entries":{}}' > "$DB"
+
+usage() {
+  cat <<EOF
+track — countup timer tracker
+
+  track list|l                        show all entries and current countup time
+  track add|a <name>                  start tracking a new entry
+  track rm|r <name>                   remove an entry entirely
+  track reset|res <name> [datetime]   log a reset (now, or at given time)
+  track undo|u <name>                 remove the most recent reset
+  track log <name>                    show full reset history
+
+  datetime format: YYYY-MM-DD-HH-MM-SS  e.g. 2026-08-24-10-11-00
+EOF
+}
+
+fmt_duration() {
+  local secs=$1
+  printf "%dd %dh %dm" $(( secs / 86400 )) $(( (secs % 86400) / 3600 )) $(( (secs % 3600) / 60 ))
+}
+
+entry_exists() {
+  [[ "$(jq --arg n "$1" '.entries | has($n)' "$DB")" == "true" ]]
+}
+
+cmd="${1:-list}"
+shift 2>/dev/null
+
+case "$cmd" in
+  list|l)
+    mapfile -t entries < <(jq -r '.entries | keys[]' "$DB")
+    if (( ${#entries[@]} == 0 )); then
+      echo "Nothing tracked yet. Use: track add <name>"
+      exit 0
+    fi
+    now=$(date +%s)
+    printf "%-20s  %-16s  %s\n" "ENTRY" "STREAK" "SINCE"
+    printf "%-20s  %-16s  %s\n" "-----" "------" "-----"
+    for name in "${entries[@]}"; do
+      last=$(jq -r --arg n "$name" '.entries[$n].resets[-1] // empty' "$DB")
+      if [[ -z "$last" ]]; then
+        created=$(jq -r --arg n "$name" '.entries[$n].created // empty' "$DB")
+        if [[ -n "$created" ]]; then
+          diff=$(( now - $(date -d "$created" +%s) ))
+          printf "%-20s  %-16s  %s\n" "$name" "$(fmt_duration "$diff")" "added $created"
+        else
+          printf "%-20s  %-16s  %s\n" "$name" "∞" "never reset"
+        fi
+      else
+        diff=$(( now - $(date -d "$last" +%s) ))
+        printf "%-20s  %-16s  %s\n" "$name" "$(fmt_duration "$diff")" "$last"
+      fi
+    done
+    ;;
+
+  add|a)
+    name="${1:?Usage: track add <name>}"
+    if entry_exists "$name"; then
+      echo "Already tracking '$name'."
+      exit 1
+    fi
+    created=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    tmp=$(mktemp)
+    jq --arg n "$name" --arg c "$created" '.entries[$n] = {"created":$c,"resets":[]}' "$DB" > "$tmp" && mv "$tmp" "$DB"
+    echo "Now tracking: $name (started $created)"
+    ;;
+
+  rm|r)
+    name="${1:?Usage: track rm <name>}"
+    tmp=$(mktemp)
+    jq --arg n "$name" 'del(.entries[$n])' "$DB" > "$tmp" && mv "$tmp" "$DB"
+    echo "Removed: $name"
+    ;;
+
+  reset|res)
+    name="${1:?Usage: track reset <name> [YYYY-MM-DD-HH-MM-SS]}"
+    if ! entry_exists "$name"; then
+      echo "Entry '$name' not found. Use: track add '$name' first."
+      exit 1
+    fi
+    if [[ -n "$2" ]]; then
+      IFS='-' read -r y mo d H M S <<< "$2"
+      ts=$(date -u -d "${y}-${mo}-${d} ${H}:${M}:${S}" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null) \
+        || { echo "Invalid datetime '$2'. Use format: YYYY-MM-DD-HH-MM-SS"; exit 1; }
+    else
+      ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    fi
+    tmp=$(mktemp)
+    jq --arg n "$name" --arg ts "$ts" '.entries[$n].resets += [$ts]' "$DB" > "$tmp" && mv "$tmp" "$DB"
+    echo "Reset logged for '$name' at $ts. Streak restarted."
+    ;;
+
+  undo|u)
+    name="${1:?Usage: track undo <name>}"
+    last=$(jq -r --arg n "$name" '.entries[$n].resets[-1] // empty' "$DB")
+    if [[ -z "$last" ]]; then
+      echo "No resets to undo for '$name'."
+      exit 0
+    fi
+    tmp=$(mktemp)
+    jq --arg n "$name" '.entries[$n].resets = .entries[$n].resets[:-1]' "$DB" > "$tmp" && mv "$tmp" "$DB"
+    echo "Removed last reset ($last) for '$name'."
+    ;;
+
+  log)
+    name="${1:?Usage: track log <name>}"
+    if ! entry_exists "$name"; then
+      echo "Entry '$name' not found."
+      exit 1
+    fi
+    count=$(jq --arg n "$name" '.entries[$n].resets | length' "$DB")
+    echo "Reset history for '$name' ($count total):"
+    jq -r --arg n "$name" '.entries[$n].resets[]' "$DB" | nl -ba
+    ;;
+
+  help|--help|-h)
+    usage
+    ;;
+
+  *)
+    echo "Unknown command: $cmd"
+    usage
+    exit 1
+    ;;
+esac

@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+import re, subprocess, sys
+
+def to_sec(s):
+    s = s.strip()
+    if s.endswith("ms"): return float(s[:-2]) / 1000
+    if s.endswith("s"):  return float(s[:-1])
+    return 0.0
+
+def pct(vals, p):
+    s = sorted(vals)
+    return s[int(round((len(s) - 1) * p / 100))]
+
+last_n = None
+args = sys.argv[1:]
+if args and args[0].lstrip('-').startswith('last'):
+    arg0 = args[0].lstrip('-')
+    if '=' in arg0:
+        last_n = int(arg0.split('=', 1)[1])
+    elif len(args) > 1:
+        last_n = int(args[1])
+
+boots = subprocess.run(
+    ["journalctl", "--list-boots", "--no-pager"],
+    capture_output=True, text=True
+).stdout.strip().splitlines()
+
+indices = [line.split()[0] for line in boots if line.strip()]
+
+fields = ["firmware", "loader", "kernel", "initrd", "userspace", "total"]
+data = {f: [] for f in fields}
+graphical = []
+
+for idx in indices:
+    out = subprocess.run(
+        ["journalctl", "-b", idx, "--no-pager", "-q", "-o", "short-monotonic"],
+        capture_output=True, text=True
+    ).stdout
+
+    startup_mono = None
+    graphical_mono = None
+    userspace_sec = None
+    parsed_line = None
+
+    for line in out.splitlines():
+        m_mono = re.match(r"\[\s*([\d.]+)\]", line)
+        if not m_mono:
+            continue
+        mono = float(m_mono.group(1))
+
+        if "systemd[1]: Startup finished" in line:
+            m = re.search(r"Startup finished in (.+?)(?:\s*systemd|\.$)", line)
+            if m:
+                parsed_line = m.group(1).strip().rstrip(".")
+                startup_mono = mono
+                m_us = re.search(r"([\d.]+(?:ms|s))\s+\(userspace\)", parsed_line)
+                if m_us:
+                    userspace_sec = to_sec(m_us.group(1))
+
+        if "systemd[1]: Reached target Graphical Interface" in line:
+            graphical_mono = mono
+
+    if parsed_line:
+        for f in fields[:-1]:
+            m = re.search(r"([\d.]+(?:ms|s))\s+\(" + f + r"\)", parsed_line)
+            if m: data[f].append(to_sec(m.group(1)))
+        m = re.search(r"=\s*([\d.]+s)", parsed_line)
+        if m: data["total"].append(to_sec(m.group(1)))
+
+    if startup_mono and graphical_mono and userspace_sec is not None:
+        g = userspace_sec - (startup_mono - graphical_mono)
+        graphical.append(g)
+
+analyzed = len(data["total"])
+suffix = f"  (last {last_n})" if last_n else ""
+print(f"boots: {analyzed} analyzed / {len(indices)} found in logs{suffix}")
+print(f"  {'phase':<12} {'avg':>7}  {'p5':>7}  {'p95':>7}  {'current':>7}")
+for f in fields:
+    vals = data[f]
+    if not vals:
+        continue
+    cur = vals[-1]
+    v = vals[-last_n:] if last_n else vals
+    print(f"  {f:<12} {sum(v)/len(v):>6.2f}s  {pct(v,5):>6.2f}s  {pct(v,95):>6.2f}s  {cur:>6.2f}s")
+    if f == "userspace" and graphical:
+        gcur = graphical[-1]
+        gv = graphical[-last_n:] if last_n else graphical
+        print(f"  {'  login scrn':<12} {sum(gv)/len(gv):>6.2f}s  {pct(gv,5):>6.2f}s  {pct(gv,95):>6.2f}s  {gcur:>6.2f}s")

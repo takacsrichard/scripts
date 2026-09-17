@@ -4,6 +4,7 @@ identical - compare paths for identity, check subsets, verify archives.
 
 Usage:
   identical [MODE] [-rs N | -st C:P] [-star] [-exclude PAT ...] <path1> <path2> [path3 ...]
+  identical [MODE] [-ref FILE] <dir>
   identical subset [-q] <dir|tar> <dir|tar>
   identical verifytar [-N n] <archive> <file1> [file2 ...]
 
@@ -17,6 +18,12 @@ Options (default identical comparison):
   -st C:P      auto-sample: C% confident <=P% of files differ  (e.g. -st 95:1)
   -star        N>2: compare all paths against first (hub-and-spoke); default is all-pairs
   -exclude PAT suppress differences whose path contains PAT (repeatable; not with -d)
+
+Single-directory scan (one dir argument):
+  Compares all files inside the dir against each other (all-pairs N:M).
+  -ref FILE    compare every file against FILE instead (1:N hub-and-spoke)
+  -d           use diff -q instead of byte-for-byte cmp
+  Prompts for confirmation before running.
 
 Subcommands:
   subset       check A<=B and B<=A subset relationships between two dirs/tar archives
@@ -245,6 +252,66 @@ def is_excluded(path: str, excludes: list[str]) -> bool:
     return any(pat in path for pat in excludes)
 
 
+# ── single-directory scan ──────────────────────────────────────────────────────
+
+def _cmd_scandir(path: str, mode: str, ref: str | None) -> int:
+    """Compare all files inside one directory against each other (or against -ref)."""
+    all_files: list[str] = []
+    for root, _, fnames in os.walk(path):
+        for name in sorted(fnames):
+            all_files.append(os.path.join(root, name))
+    all_files.sort()
+
+    if not all_files:
+        print(f'identical: {path}: no files found', file=sys.stderr)
+        return 1
+
+    if ref:
+        ref = os.path.abspath(ref)
+        if not os.path.isfile(ref):
+            print(f'identical: -ref: {ref}: not a file', file=sys.stderr)
+            return 1
+        pairs = [(ref, f) for f in all_files if os.path.abspath(f) != ref]
+        desc = f'{len(pairs)} file(s) vs reference {ref}'
+    else:
+        pairs = [(all_files[a], all_files[b])
+                 for a in range(len(all_files)) for b in range(a + 1, len(all_files))]
+        desc = f'{len(pairs)} pair(s) (all-vs-all, {len(all_files)} files)'
+
+    tool = 'diff -q' if mode == 'diff' else 'cmp'
+    print(f'Scan: {path}')
+    print(f'      {desc}')
+    print(f'      Method: {tool}')
+    if input('Proceed? [y/N] ').strip().lower() != 'y':
+        print('Aborted.', file=sys.stderr)
+        return 1
+
+    diffs = same = 0
+    for a, b in pairs:
+        rel_a = os.path.relpath(a, path) if not ref else os.path.basename(a)
+        rel_b = os.path.relpath(b, path)
+        if mode == 'diff':
+            r = subprocess.run(['diff', '-q', a, b], capture_output=True)
+            if r.returncode == 0:
+                same += 1
+            else:
+                print(f'Differ: {rel_a}  vs  {rel_b}')
+                diffs += 1
+        else:
+            if files_equal(a, b):
+                same += 1
+            else:
+                print(f'Differ: {rel_a}  vs  {rel_b}')
+                diffs += 1
+
+    total = same + diffs
+    if diffs == 0:
+        print(f'All {total} pair(s) identical')
+    else:
+        print(f'{diffs}/{total} pair(s) differ')
+    return 0 if diffs == 0 else 1
+
+
 # ── identical subcommand ───────────────────────────────────────────────────────
 
 def cmd_identical(argv: list[str]) -> int:
@@ -253,6 +320,7 @@ def cmd_identical(argv: list[str]) -> int:
     st_arg: str | None = None
     star = False
     excludes: list[str] = []
+    ref_path: str | None = None
     paths: list[str] = []
 
     i = 0
@@ -273,11 +341,23 @@ def cmd_identical(argv: list[str]) -> int:
             star = True; i += 1
         elif a == '-exclude' and i + 1 < len(argv):
             excludes.append(argv[i + 1]); i += 2
+        elif a == '-ref' and i + 1 < len(argv):
+            ref_path = argv[i + 1]; i += 2
         elif a.startswith('-'):
             print(f'identical: unknown option {a}', file=sys.stderr)
             return 1
         else:
             paths.append(a); i += 1
+
+    if len(paths) == 0:
+        print(__doc__, file=sys.stderr)
+        return 1
+
+    if len(paths) == 1:
+        if not os.path.isdir(paths[0]):
+            print('identical: single-path mode requires a directory', file=sys.stderr)
+            return 1
+        return _cmd_scandir(paths[0], mode, ref_path)
 
     if len(paths) < 2:
         print(__doc__, file=sys.stderr)

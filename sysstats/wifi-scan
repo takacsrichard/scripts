@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# wifi-scan — WiFi info for all visible BSSIDs
+# Sources: /proc/net/wireless (iface), /proc/net/dev (RX/TX),
+#          iw (dBm scan, if in PATH), nmcli (fallback scan)
+
+# ── Tool discovery ──────────────────────────────────────────────────────────
+IW=$(command -v iw 2>/dev/null || true)
+NMCLI=$(command -v nmcli 2>/dev/null || true)
+
+if [[ -z "$IW" ]]; then
+    echo "note: iw not installed — using nmcli for scan (dBm derived from %, not measured directly; sudo has no effect)" >&2
+elif [[ $EUID -ne 0 ]]; then
+    echo "note: running without root — iw scan may return cached results; sudo gives a fresh scan with direct dBm" >&2
+fi
+
+# ── Interface: /proc/net/wireless needs no external tools ───────────────────
+IFACE=$(awk 'NR>2 && /[[:alpha:]]/ { sub(/:$/, "", $1); print $1; exit }' \
+    /proc/net/wireless 2>/dev/null)
+
+# Fallbacks if /proc/net/wireless missing
+if [[ -z "$IFACE" && -n "$IW" ]]; then
+    IFACE=$($IW dev 2>/dev/null | awk '/Interface/{print $2; exit}')
+fi
+if [[ -z "$IFACE" && -n "$NMCLI" ]]; then
+    IFACE=$($NMCLI -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '/wifi/{print $1; exit}')
+fi
+
+if [[ -z "$IFACE" ]]; then
+    echo "No wireless interface found." >&2
+    exit 1
+fi
+
+# ── RX/TX from /proc/net/dev (no deps) ─────────────────────────────────────
+PROC_RX=$(awk -v dev="${IFACE}" 'index($0, dev":") {
+    sub(/.*:/, ""); gsub(/^[[:space:]]+/, ""); print $1; exit
+}' /proc/net/dev 2>/dev/null)
+PROC_TX=$(awk -v dev="${IFACE}" 'index($0, dev":") {
+    sub(/.*:/, ""); gsub(/^[[:space:]]+/, ""); print $9; exit
+}' /proc/net/dev 2>/dev/null)
+[[ -z "$PROC_RX" ]] && PROC_RX="N/A"
+[[ -z "$PROC_TX" ]] && PROC_TX="N/A"
+
+# ── Connected BSSID ─────────────────────────────────────────────────────────
+CONN_BSSID=""
+
+if [[ -n "$IW" ]]; then
+    LINK=$($IW dev "$IFACE" link 2>/dev/null)
+    if echo "$LINK" | grep -q "Connected to"; then
+        CONN_BSSID=$(echo "$LINK" | awk '/Connected to/{print toupper($3)}')
+    fi
+fi
+
+if [[ -z "$CONN_BSSID" && -n "$NMCLI" ]]; then
+    CONN_BSSID=$($NMCLI -t -f ACTIVE,BSSID device wifi list 2>/dev/null \
+        | sed -n 's/^yes://p' | sed 's/\\:/:/g' | tr '[:lower:]' '[:upper:]' | head -1)
+fi
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+fmt_bytes() {
+    [[ -z "$1" || "$1" == "N/A" ]] && echo "N/A" && return
+    awk -v b="$1" 'BEGIN {
+        if      (b >= 2^30) printf "%.1fG", b/2^30
+        else if (b >= 2^20) printf "%.1fM", b/2^20
+        else if (b >= 2^10) printf "%.1fK", b/2^10
+        else                printf "%dB",   b
+    }'
+}
+
+# ── Scan: try iw first, fall back to nmcli ──────────────────────────────────
+# Output TSV: BSSID <TAB> FREQ <TAB> DBM <TAB> PCT <TAB> BARS <TAB> SSID
+SCAN_DATA=""
+
+if [[ -n "$IW" ]]; then
+    IW_SCAN=$($IW dev "$IFACE" scan 2>/dev/null)
+    [[ -z "$IW_SCAN" ]] && IW_SCAN=$($IW dev "$IFACE" scan dump 2>/dev/null)
+
+    if [[ -n "$IW_SCAN" ]]; then
+        SCAN_DATA=$(awk '
+            function flush(   d, q, bars) {
+                if (!bssid) return
+                d = int(dbm)
+                if (dbm == "N/A" || dbm == "") { q = "N/A"; bars = "N/A" }
+                else {
+                    if (d < -100) d = -100
+                    if (d > -50)  d = -50
+                    q = (d + 100) * 2
+                    if      (q > 80) bars = "▂▄▆█"
+                    else if (q > 55) bars = "▂▄▆_"
+                    else if (q > 30) bars = "▂▄__"
+                    else if (q >  5) bars = "▂___"
+                    else             bars = "____"
+                }
+                printf "%s\t%s\t%s\t%s\t%s\t%s\n", bssid, freq, (dbm=="N/A"?"N/A":int(dbm)), q, bars, ssid
+            }
+            /^BSS / {
+                flush()
+                bssid = toupper($2); sub(/\(.*/, "", bssid)
+                freq = "N/A"; dbm = "N/A"; ssid = "(hidden)"
+            }
+            /^[[:space:]]+freq:/   { freq = $2 }
+            /^[[:space:]]+signal:/ { dbm  = $2 }
+            /^[[:space:]]+SSID:/   {
+                ssid = (NF >= 2) ? substr($0, index($0, $2)) : "(hidden)"
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", ssid)
+            }
+            END { flush() }
+        ' <<< "$IW_SCAN")
+    fi
+fi
+
+# nmcli fallback — gives % directly; derive dBm via inverse NM formula
+if [[ -z "$SCAN_DATA" && -n "$NMCLI" ]]; then
+    SCAN_DATA=$(
+        $NMCLI -f BSSID,SSID,FREQ,SIGNAL,BARS device wifi list 2>/dev/null \
+        | awk 'NR==1 || NF==0 { next }
+        {
+            # BSSID is always 17 chars: XX:XX:XX:XX:XX:XX
+            bssid = toupper(substr($0, 1, 17))
+            gsub(/[[:space:]]/, "", bssid)
+
+            # Anchor on "NNNN MHz" to locate freq, then derive positions
+            if (match($0, /[0-9]+ MHz/)) {
+                freq = substr($0, RSTART, RLENGTH - 4)   # strip " MHz"
+                ssid = substr($0, 19, RSTART - 20)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", ssid)
+                if (ssid == "") ssid = "(hidden)"
+                rest = substr($0, RSTART + RLENGTH)
+                gsub(/^[[:space:]]+/, "", rest)
+                split(rest, a, /[[:space:]]+/)
+                pct = a[1]; bars = a[2]
+            } else {
+                freq = "N/A"; ssid = "N/A"; pct = "N/A"; bars = "N/A"
+            }
+
+            # Inverse of NM formula: dBm = pct/2 - 100
+            dbm = (pct ~ /^[0-9]+$/) ? int(pct/2) - 100 : "N/A"
+
+            printf "%s\t%s\t%s\t%s\t%s\t%s\n", bssid, freq, dbm, pct, bars, ssid
+        }'
+    )
+fi
+
+# Last resort: synthesise a single entry for the connected AP from /proc
+if [[ -z "$SCAN_DATA" && -n "$CONN_BSSID" ]]; then
+    _sig=$(awk 'NR>2 { printf "%.0f", $4; exit }' /proc/net/wireless 2>/dev/null)
+    _pct=""
+    if [[ -n "$_sig" && "$_sig" != "N/A" ]]; then
+        _d=$(( _sig < -100 ? -100 : _sig > -50 ? -50 : _sig ))
+        _pct=$(( (_d + 100) * 2 ))
+        if   (( _pct > 80 )); then _bars="▂▄▆█"
+        elif (( _pct > 55 )); then _bars="▂▄▆_"
+        elif (( _pct > 30 )); then _bars="▂▄__"
+        elif (( _pct >  5 )); then _bars="▂___"
+        else _bars="____"; fi
+    fi
+    printf -v SCAN_DATA "%s\t%s\t%s\t%s\t%s\t%s" \
+        "$CONN_BSSID" "N/A" "${_sig:-N/A}" "${_pct:-N/A}" "${_bars:-N/A}" "(connected)"
+fi
+
+# ── Print table ──────────────────────────────────────────────────────────────
+printf "Interface: %s\n\n" "$IFACE"
+printf "%-17s  %-22s  %9s  %5s  %-6s  %9s  %-3s  %8s  %8s\n" \
+    "BSSID" "SSID" "dBm/RSSI" "%" "BARS" "FREQ(MHz)" "CON" "RX" "TX"
+printf '─%.0s' {1..105}; echo
+
+while IFS=$'\t' read -r bssid freq dbm pct bars ssid; do
+    con=""; rx="N/A"; tx="N/A"
+    if [[ -n "$CONN_BSSID" && "$bssid" == "$CONN_BSSID" ]]; then
+        con="*"
+        rx=$(fmt_bytes "$PROC_RX")
+        tx=$(fmt_bytes "$PROC_TX")
+    fi
+
+    [[ -n "$dbm" && "$dbm" != "N/A" ]] && sdisp="${dbm}dBm" || sdisp="N/A"
+    [[ -n "$pct" && "$pct" != "N/A" ]] && qdisp="${pct}%"   || qdisp="N/A"
+
+    printf "%-17s  %-22s  %9s  %5s  %-6s  %9s  %-3s  %8s  %8s\n" \
+        "$bssid" "${ssid:0:22}" "$sdisp" "$qdisp" "$bars" "$freq" "$con" "$rx" "$tx"
+done < <(printf '%s\n' "$SCAN_DATA")
+
+if [[ -z "$SCAN_DATA" ]]; then
+    echo "(no data — ensure iw or nmcli is available, or run with sudo)"
+fi

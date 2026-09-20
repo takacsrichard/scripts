@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import re, subprocess, sys
+import re, subprocess, sys, json, random
+from collections import defaultdict
 
 def to_sec(s):
     s = s.strip()
@@ -10,6 +11,29 @@ def to_sec(s):
 def pct(vals, p):
     s = sorted(vals)
     return s[int(round((len(s) - 1) * p / 100))]
+
+def stage_of(mono, initrd_end, userspace_end, graphical_end):
+    if mono < initrd_end:
+        return "initrd"
+    if mono < userspace_end:
+        return "userspace"
+    if graphical_end and mono < graphical_end:
+        return "graphical"
+    return "post-boot"
+
+def pick_critical(logs, n=3):
+    """Top n by priority; if ≥n share the most-critical level, random sample."""
+    if not logs:
+        return []
+    logs = sorted(logs, key=lambda x: x[0])
+    if len(logs) <= n:
+        return logs
+    min_p = logs[0][0]
+    at_min = [l for l in logs if l[0] == min_p]
+    if len(at_min) >= n:
+        return sorted(random.sample(at_min, n), key=lambda x: x[0])
+    rest = [l for l in logs if l[0] > min_p]
+    return at_min + pick_critical(rest, n - len(at_min))
 
 last_n = None
 args = sys.argv[1:]
@@ -30,6 +54,9 @@ indices = [line.split()[0] for line in boots if line.strip()]
 fields = ["firmware", "loader", "kernel", "initrd", "userspace", "total"]
 data = {f: [] for f in fields}
 graphical = []
+service_times = defaultdict(list)   # description -> [duration, ...]
+cur_svc_times = {}                   # description -> duration for boot 0
+cur_boundaries = {}                  # startup_mono, userspace_sec, graphical_mono for boot 0
 
 for idx in indices:
     out = subprocess.run(
@@ -41,6 +68,7 @@ for idx in indices:
     graphical_mono = None
     userspace_sec = None
     parsed_line = None
+    svc_starts = {}
 
     for line in out.splitlines():
         m_mono = re.match(r"\[\s*([\d.]+)\]", line)
@@ -60,6 +88,19 @@ for idx in indices:
         if "systemd[1]: Reached target Graphical Interface" in line:
             graphical_mono = mono
 
+        m_start = re.search(r"systemd\[1\]: Starting (.+)\.\.\.", line)
+        if m_start:
+            svc_starts[m_start.group(1)] = mono
+
+        m_done = re.search(r"systemd\[1\]: Started (.+)\.", line)
+        if m_done:
+            name = m_done.group(1)
+            if name in svc_starts:
+                dur = mono - svc_starts.pop(name)
+                service_times[name].append(dur)
+                if idx == "0":
+                    cur_svc_times[name] = dur
+
     if parsed_line:
         for f in fields[:-1]:
             m = re.search(r"([\d.]+(?:ms|s))\s+\(" + f + r"\)", parsed_line)
@@ -71,6 +112,14 @@ for idx in indices:
         g = userspace_sec - (startup_mono - graphical_mono)
         graphical.append(g)
 
+    if idx == "0":
+        cur_boundaries = {
+            "startup_mono": startup_mono,
+            "userspace_sec": userspace_sec,
+            "graphical_mono": graphical_mono,
+        }
+
+# --- boot phase timing ---
 analyzed = len(data["total"])
 suffix = f"  (last {last_n})" if last_n else ""
 print(f"boots: {analyzed} analyzed / {len(indices)} found in logs{suffix}")
@@ -86,3 +135,77 @@ for f in fields:
         gcur = graphical[-1]
         gv = graphical[-last_n:] if last_n else graphical
         print(f"  {'  login scrn':<12} {sum(gv)/len(gv):>6.2f}s  {pct(gv,5):>6.2f}s  {pct(gv,95):>6.2f}s  {gcur:>6.2f}s")
+
+# --- slowest services ---
+if service_times:
+    print()
+    print("slowest services (avg across all boots):")
+    top = sorted(service_times.items(), key=lambda x: -sum(x[1]) / len(x[1]))[:10]
+    print(f"  {'service':<44} {'avg':>7}  {'seen':>5}  {'current':>8}")
+    for name, times in top:
+        avg = sum(times) / len(times)
+        cur_t = cur_svc_times.get(name)
+        cur_s = f"{cur_t:>7.2f}s" if cur_t is not None else "       -"
+        print(f"  {name[:44]:<44} {avg:>6.2f}s  {len(times):>5}  {cur_s}")
+
+# --- per-stage log level counts + top critical logs (current boot only) ---
+sm = cur_boundaries.get("startup_mono")
+us = cur_boundaries.get("userspace_sec")
+gm = cur_boundaries.get("graphical_mono")
+
+if sm and us is not None:
+    initrd_end = sm - us
+    userspace_end = sm
+
+    stage_counts = defaultdict(lambda: defaultdict(int))
+    critical_logs = []
+
+    prio_out = subprocess.run(
+        ["journalctl", "-b", "0", "--no-pager", "-o", "json", "-p", "4",
+         "--output-fields=PRIORITY,__MONOTONIC_TIMESTAMP,MESSAGE"],
+        capture_output=True, text=True
+    ).stdout
+
+    for line in prio_out.splitlines():
+        if not line.strip():
+            continue
+        try:
+            e = json.loads(line)
+            p = int(e.get("PRIORITY", 7))
+            mono = int(e.get("__MONOTONIC_TIMESTAMP", 0)) / 1e6
+            msg = str(e.get("MESSAGE", "")).strip()
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+
+        stage = stage_of(mono, initrd_end, userspace_end, gm)
+        stage_counts[stage][p] += 1
+
+        if p <= 3 and msg and "Ignoring duplicate name" not in msg:
+            critical_logs.append((p, msg))
+
+    PNAME = {0: "emerg", 1: "alert", 2: "crit ", 3: "err  ", 4: "warn "}
+    STAGES = ["initrd", "userspace", "graphical", "post-boot"]
+    active = [s for s in STAGES if stage_counts[s]]
+    if active:
+        print()
+        print("log levels by boot stage (current boot):")
+        print(f"  {'level':<8}" + "".join(f"  {s:>12}" for s in active))
+        for p in range(5):
+            row = f"  {PNAME.get(p, str(p)):<8}"
+            for s in active:
+                cnt = stage_counts[s].get(p, 0)
+                row += f"  {cnt:>12}"
+            if any(stage_counts[s].get(p, 0) for s in active):
+                print(row)
+
+    print()
+    top3 = pick_critical(critical_logs)
+    if top3:
+        PLABEL = {0: "EMERG", 1: "ALERT", 2: "CRIT", 3: "ERR"}
+        print("top critical logs (current boot):")
+        for p, msg in top3:
+            label = PLABEL.get(p, str(p))
+            short = msg[:110] + "…" if len(msg) > 110 else msg
+            print(f"  [{label}] {short}")
+    else:
+        print("top critical logs (current boot): none")

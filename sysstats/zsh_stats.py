@@ -48,7 +48,7 @@ CATEGORIES = OrderedDict([
         "cargo", "rustc", "gcc", "g++", "make", "cmake",
         "claude", "go", "julia", "ruby", "perl", "lua",
         "bash", "zsh", "sh", "javac", "java", "n",
-        "Rscript", "R", "ginit", "gs", "agy", "cla",
+        "Rscript", "R", "ginit", "gs", "agy", "cla", "ollama",
     })),
     ("system",   ("System & processes",    {
         "sudo", "systemctl", "journalctl",

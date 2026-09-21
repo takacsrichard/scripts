@@ -40,7 +40,7 @@ CATEGORIES = OrderedDict([
     ("media",    ("Multimedia",            {
         "mpv", "yt-dlp", "yt", "imv", "ffmpeg", "ffprobe",
         "vlc", "feh", "sxiv", "convert", "identify",
-        "mplayer", "oz", "okular", "zathura", "evince",
+        "mplayer", "m", "oz", "okular", "zathura", "evince", "mpl", "ytq",
     })),
     ("dev",      ("Development & editors", {
         "git", "python", "python3", "nvim", "nano", "vim", "vi",
@@ -48,7 +48,7 @@ CATEGORIES = OrderedDict([
         "cargo", "rustc", "gcc", "g++", "make", "cmake",
         "claude", "go", "julia", "ruby", "perl", "lua",
         "bash", "zsh", "sh", "javac", "java", "n",
-        "Rscript", "R", "ginit", "gs",
+        "Rscript", "R", "ginit", "gs", "agy", "cla",
     })),
     ("system",   ("System & processes",    {
         "sudo", "systemctl", "journalctl",
@@ -72,7 +72,7 @@ CATEGORIES = OrderedDict([
     ("nix",      ("Nix / packages",        {
         "nix", "nix-shell", "nix-build", "nix-env",
         "nixos-rebuild", "nix-store",
-        "home-manager", "just",
+        "home-manager", "just", "cn", "hn",
     })),
     ("security", ("Security & auth",       {
         "rbw", "gpg", "openssl", "ssh-keygen",
@@ -82,7 +82,7 @@ CATEGORIES = OrderedDict([
         "qalc", "bc", "cal", "date", "time", "timeout",
         "tldr", "man", "info", "which", "whereis", "type",
         "aliases", "lmk", "track", "sz",
-        "cla", "c", "o",
+        "c", "o", "t",
         "sourcezsh", "szsh", "zshcfgsrc",
         "cowsay", "todo", "history", "h",
     })),
@@ -335,6 +335,25 @@ timestamped = parse_timestamps(HISTORY)
 ts_total    = len(timestamped)
 time_ctr    = Counter(time_block(ts) for ts, _ in timestamped)
 
+_now     = datetime.now().timestamp()
+_w2      = _now - 14 * 86400
+_w4      = _now - 28 * 86400
+_ts_cur  = [(ts, e) for ts, e in timestamped if ts >= _w2]
+_ts_prev = [(ts, e) for ts, e in timestamped if _w4 <= ts < _w2]
+
+def _ts_cats(window):
+    ctr = Counter()
+    for _, e in window:
+        b = base_of(e)
+        if b:
+            ctr[categorize(b)] += 1
+    return ctr
+
+_tc_cur      = _ts_cats(_ts_cur)
+_tc_prev     = _ts_cats(_ts_prev)
+_tc_cur_tot  = sum(_tc_cur.values())
+_tc_prev_tot = sum(_tc_prev.values())
+
 cat_total = sum(cat_ctr.values())
 trend_note = f"last {WINDOW} vs prev {WINDOW}" if _older else f"need >{2*WINDOW} entries for trend"
 sec_hdr(f"COMMAND CATEGORIES  ({trend_note})")
@@ -350,6 +369,29 @@ for key in sorted(all_keys, key=lambda k: cat_ctr.get(k, 0), reverse=True):
     print(f"  {label:<28}  {cnt:>6}  {pct:>5.1f}%  {trend_col(key):>7}  {bar(pct)}")
 print()
 
+no_prev = _tc_prev_tot == 0
+prev_hdr = "prev 2w*" if no_prev else " prev 2w"
+sec_hdr(f"COMMAND CATEGORIES  (last 2w={_tc_cur_tot} cmds  vs  prev 2w={'N/A' if no_prev else _tc_prev_tot})")
+print(f"  {'category':<28}  {'last 2w':>7}  {prev_hdr:>8}  {'delta':>7}")
+print(f"  {'─'*28}  {'─'*7}  {'─'*8}  {'─'*7}")
+seen = set(_tc_cur) | set(_tc_prev)
+for key in sorted(seen, key=lambda k: _tc_cur.get(k, 0), reverse=True):
+    c = _tc_cur.get(key, 0)
+    p = _tc_prev.get(key, 0)
+    if c == 0 and p == 0:
+        continue
+    lbl = CATEGORIES[key][0] if key in CATEGORIES else "Uncategorized"
+    ps  = "     N/A" if no_prev else f"{p:>8}"
+    ds  = "     N/A" if no_prev else f"{c - p:>+7}"
+    print(f"  {lbl:<28}  {c:>7}  {ps}  {ds}")
+print(f"  {'─'*28}  {'─'*7}  {'─'*8}  {'─'*7}")
+if no_prev:
+    print(f"  {'TOTAL':<28}  {_tc_cur_tot:>7}  {'     N/A'}  {'    N/A'}")
+    print(f"  (* prev 2w has no data yet — need {14 - int((_now - min((ts for ts, _ in timestamped), default=_now)) / 86400)} more days of history)")
+else:
+    print(f"  {'TOTAL':<28}  {_tc_cur_tot:>7}  {_tc_prev_tot:>8}  {_tc_cur_tot - _tc_prev_tot:>+7}")
+print()
+
 if ts_total == 0:
     print(f"  (no timestamped entries — enable EXTENDED_HISTORY to get time-of-day stats)")
 else:
@@ -360,4 +402,11 @@ else:
         cnt = time_ctr.get(label, 0)
         pct = cnt / ts_total * 100
         print(f"  {label:<14}  {cnt:>6}  {pct:>5.1f}%  {bar(pct)}")
+
+uncategorized_top = [(cmd, cnt) for cmd, cnt in base_ctr.most_common() if categorize(cmd) == "uncategorized"][:5]
+sec_hdr("TOP 5 — UNCATEGORIZED COMMANDS")
+print(f"  {'#':>3}  {'command':<46}  {'cnt':>5}  {'%':>6}")
+print(f"  {'─'*3}  {'─'*46}  {'─'*5}  {'─'*6}")
+for rank, (cmd, cnt) in enumerate(uncategorized_top, 1):
+    print(f"  {rank:>3}  {trunc(cmd):<46}  {cnt:>5}  {cnt/n*100:>5.1f}%")
 print()

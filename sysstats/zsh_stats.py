@@ -39,7 +39,7 @@ CATEGORIES = OrderedDict([
     })),
     ("media",    ("Multimedia",            {
         "mpv", "yt-dlp", "yt", "imv", "ffmpeg", "ffprobe",
-        "vlc", "feh", "sxiv", "convert", "identify",
+        "vlc", "feh", "sxiv", "convert", "identify", "getmusic",
         "mplayer", "m", "oz", "okular", "zathura", "evince", "mpl", "ytq",
     })),
     ("dev",      ("Development & editors", {

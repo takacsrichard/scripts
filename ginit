@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Init a local dir and push to gitlab as takacsrichard/<name>
+# Usage: ginit -n <repo_name> [-c "commit message"] [-p (public)]
+set -uo pipefail
+
+repo_name=""
+commit_msg="initial commit"
+visibility="private"
+
+while getopts ":n:c:p" opt; do
+    case "$opt" in
+        n) repo_name="$OPTARG" ;;
+        c) commit_msg="$OPTARG" ;;
+        p) visibility="public" ;;
+        :) echo "ginit: -$OPTARG requires an argument" >&2; exit 1 ;;
+        \?) echo "ginit: unknown option -$OPTARG" >&2; exit 1 ;;
+    esac
+done
+
+if [[ -z "$repo_name" ]]; then
+    echo "Usage: ginit -n <repo_name> [-c \"commit message\"] [-p (public)]" >&2
+    exit 1
+fi
+
+current_dir="$PWD"
+read -rp "Push '${current_dir}' to gitlab:takacsrichard/${repo_name}.git? [y/N] " confirm </dev/tty
+if [[ "$confirm" != [Yy] ]]; then
+    echo "Aborted."
+    exit 1
+fi
+
+# Safety: bail out if the repo already has commits (i.e. this isn't a fresh init)
+if git rev-parse HEAD &>/dev/null 2>&1; then
+    existing_remote="$(git remote get-url origin 2>/dev/null || echo '(none)')"
+    echo "ginit: this directory already has git history." >&2
+    echo "  Current remote: $existing_remote" >&2
+    echo "  Use 'git remote set-url origin <url>' manually if you really want to change it." >&2
+    exit 1
+fi
+
+git init
+
+remote_url="git@gitlab.com:takacsrichard/${repo_name}.git"
+if git remote get-url origin &>/dev/null; then
+    git remote set-url origin "$remote_url"
+else
+    git remote add origin "$remote_url"
+fi
+
+git add .
+
+echo ""
+git status
+echo ""
+read -rp "Commit and push the above to gitlab:takacsrichard/${repo_name}.git? [y/N] " proceed </dev/tty
+if [[ "$proceed" != [Yy] ]]; then
+    echo "Aborted. Remote is set to: git@gitlab.com:takacsrichard/${repo_name}.git"
+    echo "Files are staged but not committed — re-run ginit when ready."
+    git reset HEAD -- . &>/dev/null
+    exit 1
+fi
+
+# Only commit if there is something to commit
+if ! git diff --cached --quiet; then
+    git commit -m "$commit_msg"
+fi
+
+# Create the GitLab repo via API before pushing so git push doesn't hang
+# waiting for a non-existent remote. Token fetched from rbw (Bitwarden).
+gl_token="$(rbw get "gitlab stuff personal access token" 2>/dev/null)"
+if [[ -z "$gl_token" ]]; then
+    echo "ginit: warning: could not fetch GitLab token from rbw — skipping remote repo creation." >&2
+    echo "  If the repo doesn't exist on GitLab, the push will fail. Create it manually first." >&2
+else
+    api_resp=$(curl -sfS --max-time 15 \
+        --write-out '\n%{http_code}' \
+        --header "PRIVATE-TOKEN: $gl_token" \
+        --header "Content-Type: application/json" \
+        --data "{\"name\":\"${repo_name}\",\"visibility\":\"${visibility}\",\"initialize_with_readme\":false}" \
+        "https://gitlab.com/api/v4/projects" 2>&1)
+    http_code="${api_resp##*$'\n'}"
+    case "$http_code" in
+        201) echo "  → GitLab repo created (${visibility}): https://gitlab.com/takacsrichard/${repo_name}" ;;
+        400) echo "  → GitLab repo already exists, skipping creation." ;;
+        *)   echo "ginit: GitLab API returned HTTP ${http_code} — continuing anyway." >&2 ;;
+    esac
+fi
+
+git branch -M main &&
+git push --set-upstream origin main

@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Convert FLAC to Opus; -d deletes originals, -b <rate> sets bitrate (default: 128k)
+shopt -s globstar nullglob
+set -uo pipefail
+
+ffmpeg_bin="$(command -v ffmpeg || true)"
+rm_bin="$(command -v rm || true)"
+if [[ -z "$ffmpeg_bin" ]]; then
+    echo "ftoo: ffmpeg not found — add it to your nix config or run: nix shell nixpkgs#ffmpeg" >&2
+    exit 1
+fi
+
+delete=false
+bitrate="128k"
+path=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--delete)  delete=true; shift ;;
+        -b|--bitrate) bitrate="$2"; shift 2 ;;
+        *)            path="$1"; shift ;;
+    esac
+done
+
+if [[ -z "$path" ]]; then
+    echo "Usage: ftoo <file|dir> [-d] [-b <bitrate>]"
+    exit 1
+fi
+
+files=()
+if [[ -f "$path" ]]; then
+    files=("$path")
+elif [[ -d "$path" ]]; then
+    files=("${path}"/**/*.flac)
+else
+    echo "ftoo: '$path': not a file or directory" >&2
+    exit 1
+fi
+
+if (( ${#files[@]} == 0 )); then
+    echo "ftoo: no FLAC files found in '$path'" >&2
+    exit 1
+fi
+
+count=0
+failed=0
+skipped=0
+overwrite_all=false
+
+for input in "${files[@]}"; do
+    output="${input%.flac}.opus"
+    base="$(basename "$input")"
+    if [[ -f "$output" ]] && [[ $overwrite_all == false ]]; then
+        read -rp "'$(basename "$output")' exists. Overwrite? [y / N / Y=all] " confirm
+        case "$confirm" in
+            Y) overwrite_all=true ;;
+            y) ;;
+            *) skipped=$(( skipped + 1 )); continue ;;
+        esac
+    fi
+    printf 'Converting: %s\n' "$base"
+    if "$ffmpeg_bin" -loglevel warning -i "$input" -c:a libopus -b:a "$bitrate" \
+              -vbr on -application audio -y "$output"; then
+        [[ $delete == true ]] && [[ -n "$rm_bin" ]] && "$rm_bin" "$input"
+        count=$(( count + 1 ))
+    else
+        printf 'Failed: %s\n' "$input" >&2
+        failed=$(( failed + 1 ))
+    fi
+done
+
+(( ${#files[@]} > 1 )) && printf 'Done: %d converted, %d skipped, %d failed\n' "$count" "$skipped" "$failed"

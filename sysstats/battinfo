@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Battery stats from sysfs (this hardware exposes charge_* in uAh + current_now
+# in uA, not the energy_*/power_now uWh/uW pair some laptops use instead).
+set -uo pipefail
+
+dir="${1:-/sys/class/power_supply/BAT0}"
+if [[ ! -d "$dir" ]]; then
+    echo "battinfo: no such battery dir: $dir" >&2
+    exit 1
+fi
+
+_read() { cat "$dir/$1" 2>/dev/null; }
+
+pct=$(_read capacity)
+bstatus=$(_read status)
+charge_now=$(_read charge_now)
+charge_full=$(_read charge_full)
+charge_full_design=$(_read charge_full_design)
+current_now=$(_read current_now)
+voltage_now=$(_read voltage_now)
+model=$(_read model_name)
+cycles=$(_read cycle_count)
+
+if [[ -z "$charge_now" || -z "$charge_full" || -z "$charge_full_design" ]]; then
+    echo "battinfo: missing charge_* attributes under $dir" >&2
+    exit 1
+fi
+
+# uAh -> Ah for display
+now_ah=$(awk -v v="$charge_now" 'BEGIN{printf "%.3f", v/1e6}')
+full_ah=$(awk -v v="$charge_full" 'BEGIN{printf "%.3f", v/1e6}')
+design_ah=$(awk -v v="$charge_full_design" 'BEGIN{printf "%.3f", v/1e6}')
+
+health=$(awk -v f="$charge_full" -v d="$charge_full_design" 'BEGIN{printf "%.1f", (f/d)*100}')
+degradation=$(awk -v h="$health" 'BEGIN{printf "%.1f", 100-h}')
+
+watts="n/a"
+rate_desc="n/a"
+if [[ -n "$current_now" && -n "$voltage_now" && "$current_now" != 0 ]]; then
+    watts=$(awk -v i="$current_now" -v v="$voltage_now" 'BEGIN{printf "%.2f", (i/1e6)*(v/1e6)}')
+    case "$bstatus" in
+        Discharging) rate_desc="-${watts}W" ;;
+        Charging)    rate_desc="+${watts}W" ;;
+        *)           rate_desc="${watts}W" ;;
+    esac
+fi
+
+time_desc="n/a"
+if [[ -n "$current_now" && "$current_now" != 0 ]]; then
+    case "$bstatus" in
+        Discharging)
+            target=$(awk -v f="$charge_full" 'BEGIN{printf "%.0f", f*0.10}')
+            if (( charge_now > target )); then
+                hrs=$(awk -v c="$charge_now" -v t="$target" -v i="$current_now" 'BEGIN{printf "%.2f", (c-t)/i}')
+                time_desc="${hrs}h to 10%"
+            else
+                hrs=$(awk -v c="$charge_now" -v i="$current_now" 'BEGIN{printf "%.2f", c/i}')
+                time_desc="already <=10%, ${hrs}h to empty"
+            fi
+            ;;
+        Charging)
+            hrs=$(awk -v f="$charge_full" -v c="$charge_now" -v i="$current_now" 'BEGIN{printf "%.2f", (f-c)/i}')
+            time_desc="${hrs}h to full"
+            ;;
+        *)
+            time_desc="n/a (status: $bstatus)"
+            ;;
+    esac
+fi
+
+echo "Battery:        ${model:-unknown}"
+echo "Status:         ${bstatus:-unknown}"
+echo "Charge:         ${pct}%  (${now_ah} Ah / ${full_ah} Ah max)"
+echo "Rated capacity: ${design_ah} Ah (design)"
+echo "Max capacity:   ${full_ah} Ah (current full)"
+echo "Health:         ${health}%  (degradation: ${degradation}%)"
+echo "Rate:           ${rate_desc}"
+echo "Estimate:       ${time_desc}"
+[[ -n "$cycles" ]] && echo "Cycles:         ${cycles}"

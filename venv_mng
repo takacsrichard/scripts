@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# venv_mng — single entrypoint for per-project Python venv management
+# (create / delete / activate / deactivate / list), driven by a stdin menu
+# when no action is given as an argument.
+#
+# A script cannot change its parent shell's environment, so activate/deactivate
+# can't literally activate anything by themselves: they print the shell command
+# needed (e.g. "source .venv/bin/activate") to stdout, and nothing else ever
+# goes to stdout, so it's safe to wrap this in eval. All human-readable output
+# goes to stderr. Pair it with a shell shim, e.g. in zsh:
+#   venvm() { eval "$(venv_mng "$@")"; }
+set -uo pipefail
+
+log() { printf '%s\n' "$*" >&2; }
+
+find_venvs() {
+    find "$HOME" -name "pyvenv.cfg" -not -path "*/.git/*" 2>/dev/null
+}
+
+do_create() {
+    local name="${1:-.venv}"
+    if uv venv "$name" >&2; then
+        log "Created venv at ./$name (uv)"
+    else
+        log "Failed to create venv."
+        return 1
+    fi
+}
+
+do_list() {
+    local -a venvs=()
+    local cfg v size i=1
+
+    log "Scanning $HOME for virtual environments..."
+    while IFS= read -r cfg; do
+        venvs+=("$(dirname "$cfg")")
+    done < <(find_venvs)
+
+    if (( ${#venvs[@]} == 0 )); then
+        log "No virtual environments found."
+        return 0
+    fi
+
+    log ""
+    log "Found ${#venvs[@]} virtual environment(s):"
+    for v in "${venvs[@]}"; do
+        size="$(du -sh "$v" 2>/dev/null | cut -f1)"
+        log "  $i) [$size]  $v"
+        (( i++ ))
+    done
+}
+
+do_delete() {
+    local name="${1:-}"
+    local -a venvs=()
+    local cfg v size i=1 choice confirm target
+
+    if [[ -n "$name" ]]; then
+        if [[ ! -d "$name" ]]; then
+            log "No venv found at $name"
+            return 1
+        fi
+        target="$name"
+    else
+        log "Scanning $HOME for virtual environments..."
+        while IFS= read -r cfg; do
+            venvs+=("$(dirname "$cfg")")
+        done < <(find_venvs)
+
+        if (( ${#venvs[@]} == 0 )); then
+            log "No virtual environments found."
+            return 0
+        fi
+
+        log ""
+        log "Found ${#venvs[@]} virtual environment(s):"
+        for v in "${venvs[@]}"; do
+            size="$(du -sh "$v" 2>/dev/null | cut -f1)"
+            log "  $i) [$size]  $v"
+            (( i++ ))
+        done
+
+        read -rp "Enter number to delete (or press Enter to cancel): " choice
+        if [[ -z "$choice" ]]; then
+            log "Cancelled."
+            return 0
+        fi
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#venvs[@]} )); then
+            log "Invalid choice."
+            return 1
+        fi
+        target="${venvs[$((choice - 1))]}"
+    fi
+
+    read -rp "Delete '$target'? [y/N] " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        rm -rf "$target"
+        log "Deleted $target"
+    else
+        log "Aborted."
+    fi
+}
+
+do_activate() {
+    local name="${1:-.venv}"
+    if [[ -f "$name/bin/activate" ]]; then
+        echo "source $(realpath "$name/bin/activate")"
+    else
+        log "No venv found at ./$name"
+        return 1
+    fi
+}
+
+do_deactivate() {
+    if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+        echo "deactivate"
+    else
+        log "No venv active."
+    fi
+}
+
+action="${1:-}"
+[[ $# -gt 0 ]] && shift
+
+if [[ -z "$action" ]]; then
+    log "venv_mng — pick an action:"
+    log "  1) create"
+    log "  2) delete"
+    log "  3) activate"
+    log "  4) deactivate"
+    log "  5) list"
+    read -rp "Choice: " choice
+    case "$choice" in
+        1|create)     action=create ;;
+        2|delete)     action=delete ;;
+        3|activate)   action=activate ;;
+        4|deactivate) action=deactivate ;;
+        5|list)       action=list ;;
+        *) log "Invalid choice."; exit 1 ;;
+    esac
+fi
+
+case "$action" in
+    create)     do_create "$@" ;;
+    delete)     do_delete "$@" ;;
+    activate)   do_activate "$@" ;;
+    deactivate) do_deactivate "$@" ;;
+    list)       do_list "$@" ;;
+    *) log "Usage: venv_mng [create|delete|activate|deactivate|list] [name]"; exit 1 ;;
+esac

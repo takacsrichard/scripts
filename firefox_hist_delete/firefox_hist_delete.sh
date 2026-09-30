@@ -7,6 +7,17 @@ CRITERIA="$SCRIPT_DIR/deletion_criteria.txt"
 
 die() { echo "Error: $*" >&2; exit 1; }
 
+QUIET=0
+while getopts "q" opt; do
+    case "$opt" in
+        q) QUIET=1 ;;
+        *) die "Usage: $0 [-q]" ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+[[ "$QUIET" -eq 1 ]] && exec 1>/dev/null
+
 if command -v sqlite3 &>/dev/null; then
     sql() { sqlite3 "$1" <<< "$2"; }
 else
@@ -28,15 +39,20 @@ mapfile -t KEYWORDS < <(
 
 # ── Firefox check ──────────────────────────────────────────────────────────────
 if pgrep -x firefox &>/dev/null; then
-    echo "Firefox is currently open. It must be closed to edit its files."
-    read -rp "Kill Firefox? [Y/N] " ans
-    if [[ "$ans" =~ ^[Yy]$ ]]; then
+    if [[ "$QUIET" -eq 1 ]]; then
         kill "$(pgrep -o firefox)"
-        echo "Waiting for Firefox to close..."
         sleep 2
     else
-        echo "Aborted."
-        exit 0
+        echo "Firefox is currently open. It must be closed to edit its files."
+        read -rp "Kill Firefox? [Y/N] " ans
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+            kill "$(pgrep -o firefox)"
+            echo "Waiting for Firefox to close..."
+            sleep 2
+        else
+            echo "Aborted."
+            exit 0
+        fi
     fi
 fi
 
@@ -84,6 +100,7 @@ KW_GREP=$(printf '%s\n' "${KEYWORDS[@]}" | paste -sd '|')
 
 # ── Per-section helper ─────────────────────────────────────────────────────────
 ask() {
+    [[ "$QUIET" -eq 1 ]] && return 0
     read -rp "${1:-Delete the above?} [Y/N] " _ans
     [[ "$_ans" =~ ^[Yy]$ ]]
 }

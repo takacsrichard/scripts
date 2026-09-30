@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Archive a directory (or cwd) into a dated tar.gz. Usage: archive [target_dir]
+set -uo pipefail
+
+if (( $# > 0 )); then
+    target="$1"
+    outname="$(basename "$1")"
+else
+    target="$PWD"
+    outname="$(basename "$PWD")"
+fi
+
+filecount="$(find "$target" -type f | wc -l)"
+if (( filecount > 20 )); then
+    read -rp "Warning: $filecount files found in '$target'. Continue? [y/N] " confirm
+    if [[ "$confirm" != [Yy] ]]; then
+        echo "Aborted."
+        exit 1
+    fi
+fi
+
+outfile="${outname}_$(date +%Y%m%d).tar.gz"
+tmpfile="/tmp/$outfile"
+
+tar czf "$tmpfile" -C "$target" --transform 's|^\./||' .
+mv "$tmpfile" "$outfile"
+echo "Archived $filecount files → $outfile"

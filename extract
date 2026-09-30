@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Universal extract. Usage: extract [-f] <file>
+# -f: extract into a new folder named after the archive, instead of cwd.
+set -uo pipefail
+
+into_folder=false
+file=""
+for arg in "$@"; do
+    case "$arg" in
+        -f) into_folder=true ;;
+        *)  file="$arg" ;;
+    esac
+done
+
+if [[ -z "$file" ]]; then
+    echo "Usage: extract [-f] <file>"
+    exit 1
+fi
+
+if [[ ! -e "$file" ]]; then
+    echo "File not found: $file"
+    exit 1
+fi
+
+if [[ "$into_folder" == true ]]; then
+    folder="$(basename "$file" | sed -E 's/\.(tar\.(gz|bz2|xz)|tgz|zip|gz|7z)$//')"
+    mkdir -p "$folder"
+    case "$file" in
+        *.tar.gz|*.tgz) tar xzf "$file" -C "$folder" ;;
+        *.tar.bz2)      tar xjf "$file" -C "$folder" ;;
+        *.tar.xz)       tar xJf "$file" -C "$folder" ;;
+        *.zip)          unzip "$file" -d "$folder" ;;
+        *.gz)           cp "$file" "$folder/" && gunzip "$folder/$(basename "$file")" ;;
+        *.7z)           7z x "$file" -o"$folder" ;;
+        *)              echo "Unknown format: $file"; exit 1 ;;
+    esac
+    echo "Extracted into ./$folder/"
+else
+    case "$file" in
+        *.tar.gz|*.tgz) tar xzf "$file" ;;
+        *.tar.bz2)      tar xjf "$file" ;;
+        *.tar.xz)       tar xJf "$file" ;;
+        *.zip)          unzip "$file" ;;
+        *.gz)           gunzip "$file" ;;
+        *.7z)           7z x "$file" ;;
+        *)              echo "Unknown format: $file"; exit 1 ;;
+    esac
+fi

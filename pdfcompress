@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Compress all PDFs in the current directory with ghostscript, keeping
+# the originals in ./orig_pdfs/.
+shopt -s nullglob
+set -uo pipefail
+
+pdfs=(*.pdf)
+
+if (( ${#pdfs[@]} == 0 )); then
+    echo "No PDFs found in current directory."
+    exit 1
+fi
+
+mkdir -p orig_pdfs
+
+for pdf in "${pdfs[@]}"; do
+    [[ -f "$pdf" ]] || continue
+    filename="$(basename "$pdf")"
+    mv "$pdf" "orig_pdfs/$filename"
+    echo "Compressing $filename..."
+    if gs -sDEVICE=pdfwrite \
+          -dCompatibilityLevel=1.4 \
+          -dPDFSETTINGS=/ebook \
+          -dNOPAUSE \
+          -dQUIET \
+          -dBATCH \
+          -sOutputFile="$filename" \
+          "orig_pdfs/$filename"; then
+        echo "✓ $filename"
+    else
+        echo "✗ Failed: $filename"
+    fi
+done
+
+echo "Done. Originals in ./orig_pdfs/"

@@ -38,7 +38,7 @@ CATEGORIES = OrderedDict([
         "copy", "identical", "is-subset",
     })),
     ("media",    ("Multimedia",            {
-        "mpv", "yt-dlp", "yt", "imv", "ffmpeg", "ffprobe",
+        "mpv", "yt-dlp", "yt", "imv", "swayimg", "sw", "ffmpeg", "ffprobe",
         "vlc", "feh", "sxiv", "convert", "identify", "getmusic",
         "mplayer", "m", "oz", "okular", "zathura", "evince", "mpl", "ytq",
     })),
@@ -48,7 +48,7 @@ CATEGORIES = OrderedDict([
         "cargo", "rustc", "gcc", "g++", "make", "cmake",
         "claude", "go", "julia", "ruby", "perl", "lua",
         "bash", "zsh", "sh", "javac", "java", "n",
-        "Rscript", "R", "ginit", "gs", "agy", "cla", "ollama",
+        "Rscript", "R", "ginit", "cld", "gs", "agy", "cla", "ollama",
     })),
     ("system",   ("System & processes",    {
         "sudo", "systemctl", "journalctl",

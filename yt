@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Play yt audio; -d also downloads as opus with full metadata+thumbnail to the
+# current directory. -sc searches SoundCloud instead of YouTube.
+set -uo pipefail
+
+download=false
+soundcloud=false
+args=()
+for arg in "$@"; do
+    case "$arg" in
+        -d)  download=true ;;
+        -sc) soundcloud=true ;;
+        *)   args+=("$arg") ;;
+    esac
+done
+
+if [[ "$soundcloud" == true ]]; then
+    if [[ "$download" == true ]]; then
+        yt-dlp -x --audio-format mp3 --audio-quality 0 \
+            --embed-thumbnail --embed-metadata \
+            -o "%(title)s.%(ext)s" \
+            "scsearch1:${args[*]}" &
+    fi
+    mpv --no-video \
+        --ytdl-raw-options-append="force-ipv4=" \
+        "ytdl://scsearch1:${args[*]}"
+    exit 0
+fi
+
+cookie_file="${XDG_CACHE_HOME:-$HOME/.cache}/yt-cookies.txt"
+cookie_args=()
+used_cache=false
+
+# Use cached cookie file if < 24h old; otherwise re-extract from Firefox and save
+if [[ -f "$cookie_file" ]] && (( $(date +%s) - $(stat -c %Y "$cookie_file") < 86400 )); then
+    cookie_args=(--cookies "$cookie_file")
+    used_cache=true
+else
+    cookie_args=(--cookies-from-browser firefox --cookies "$cookie_file")
+fi
+
+if [[ "$download" == true ]]; then
+    yt-dlp -x --audio-format opus --audio-quality 0 \
+        --embed-thumbnail --embed-metadata \
+        "${cookie_args[@]}" --force-ipv4 \
+        -o "%(title)s.%(ext)s" \
+        "ytsearch1:${args[*]}" &
+fi
+
+mpv --no-video \
+    --ytdl-raw-options-append="cookies-from-browser=firefox" \
+    --ytdl-raw-options-append="extractor-args=youtube:player_client=web,mweb" \
+    --ytdl-raw-options-append="force-ipv4=" \
+    "ytdl://ytsearch1:${args[*]}"
+
+# Silently refresh the cookie file in the background after each fast-path call,
+# so the next invocation always hits the cache
+if [[ $used_cache == true ]]; then
+    yt-dlp --cookies-from-browser firefox --cookies "$cookie_file" \
+        --skip-download -q "https://www.youtube.com/watch?v=dQw4w9WgXcQ" \
+        &>/dev/null &
+fi

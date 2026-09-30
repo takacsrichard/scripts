@@ -13,12 +13,15 @@ import logging
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DOWNLOAD_DIR  = Path(os.environ.get("YTDLP_DOWNLOAD_DIR", "/staging/ytdlp"))
-ARCHIVE_FILE  = DOWNLOAD_DIR / "archive.txt"
-LOG_FILE      = DOWNLOAD_DIR / "ytdlp.log"
 BASE_DIR      = Path.home() / "global_scripts/yt-dlp-ingest"
-DB_FILE       = BASE_DIR / "state" / "queue.db"
-PID_FILE      = BASE_DIR / "state" / "daemon.pid"
+STATE_DIR     = BASE_DIR / "state"
+DB_FILE       = STATE_DIR / "queue.db"
+PID_FILE      = STATE_DIR / "daemon.pid"
+ARCHIVE_FILE  = STATE_DIR / "archive.txt"
+LOG_FILE      = STATE_DIR / "ytdlp.log"
+# Used only when an item has no usable cwd (older queue rows, or the
+# directory it was queued from no longer exists).
+FALLBACK_DIR  = Path(os.environ.get("YTDLP_DOWNLOAD_DIR", str(Path.home() / "Downloads")))
 YTDLP_BIN     = "yt-dlp"
 POLL_INTERVAL = 60   # seconds between queue checks
 WORKER_IDLE_SLEEP = 5  # seconds a worker sleeps when queue is empty
@@ -30,9 +33,6 @@ SCALE_TABLE = [
     (5,  2),
     (0,  1),
 ]
-
-# Output template for yt-dlp
-OUTPUT_TEMPLATE = str(DOWNLOAD_DIR / "%(uploader)s/%(title)s [%(id)s].%(ext)s")
 
 # ── Globals ────────────────────────────────────────────────────────────────────
 _shutdown   = threading.Event()
@@ -48,7 +48,7 @@ log = logging.getLogger("ytdlp-daemon")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 def setup_logging():
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
     fh = logging.FileHandler(LOG_FILE)
@@ -84,10 +84,14 @@ def init_db():
                 finished_at TEXT,
                 worker_id   INTEGER,
                 error       TEXT,
-                retry_count INTEGER DEFAULT 0
+                retry_count INTEGER DEFAULT 0,
+                cwd         TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_status ON queue(status);
         """)
+        cols = [row["name"] for row in c.execute("PRAGMA table_info(queue)")]
+        if "cwd" not in cols:
+            c.execute("ALTER TABLE queue ADD COLUMN cwd TEXT")
 
 
 def _count_statuses() -> dict:
@@ -97,13 +101,13 @@ def _count_statuses() -> dict:
     return {r["status"]: r["n"] for r in rows}
 
 
-def _claim_next(worker_id: int, generation: int) -> tuple[int, str] | None:
-    """Atomically claim one pending URL for this worker. Returns (id, url) or None."""
+def _claim_next(worker_id: int, generation: int) -> tuple[int, str, str | None] | None:
+    """Atomically claim one pending URL for this worker. Returns (id, url, cwd) or None."""
     with _db_lock:
         c = _conn()
         try:
             row = c.execute(
-                "SELECT id, url FROM queue WHERE status='pending' ORDER BY id ASC LIMIT 1"
+                "SELECT id, url, cwd FROM queue WHERE status='pending' ORDER BY id ASC LIMIT 1"
             ).fetchone()
             if row is None:
                 return None
@@ -112,7 +116,7 @@ def _claim_next(worker_id: int, generation: int) -> tuple[int, str] | None:
                 (worker_id, row["id"]),
             )
             c.commit()
-            return row["id"], row["url"]
+            return row["id"], row["url"], row["cwd"]
         finally:
             c.close()
 
@@ -148,9 +152,11 @@ def _mark_already_downloaded(item_id: int):
 # ── Partial file cleanup ───────────────────────────────────────────────────────
 _INTERMEDIATE_RE = re.compile(r"\[.+?\]\.f\d+\.\w+$")
 
-def _clean_part_files():
+def _clean_part_files(target_dir: Path):
     """Remove .part files and yt-dlp intermediate format files (e.g. [ID].f251.webm)."""
-    for f in DOWNLOAD_DIR.rglob("*"):
+    if not target_dir.is_dir():
+        return
+    for f in target_dir.rglob("*"):
         if not f.is_file():
             continue
         if f.suffix == ".part" or _INTERMEDIATE_RE.search(f.name):
@@ -162,18 +168,31 @@ def _clean_part_files():
 
 
 # ── yt-dlp invocation ─────────────────────────────────────────────────────────
-def _run_ytdlp(item_id: int, url: str, worker_id: int):
+def _resolve_target_dir(cwd: str | None) -> Path:
+    """Download into the directory `ytq add` was called from, if it still exists."""
+    if cwd:
+        d = Path(cwd)
+        if d.is_dir():
+            return d
+        log.warning(f"Queued cwd no longer exists, falling back: {d}")
+    FALLBACK_DIR.mkdir(parents=True, exist_ok=True)
+    return FALLBACK_DIR
+
+
+def _run_ytdlp(item_id: int, url: str, cwd: str | None, worker_id: int):
+    target_dir = _resolve_target_dir(cwd)
+    output_template = str(target_dir / "%(uploader)s/%(title)s [%(id)s].%(ext)s")
     cmd = [
         YTDLP_BIN,
         "-N", "4",
         "--download-archive", str(ARCHIVE_FILE),
-        "-o", OUTPUT_TEMPLATE,
+        "-o", output_template,
         "--no-colors",
         "--newline",
         "--progress",
         url,
     ]
-    log.info(f"[W{worker_id}] START {url}")
+    log.info(f"[W{worker_id}] START {url} -> {target_dir}")
 
     output_lines: list[str] = []
     already_downloaded = False
@@ -214,12 +233,12 @@ def _run_ytdlp(item_id: int, url: str, worker_id: int):
         else:
             tail = "\n".join(output_lines[-15:])
             log.error(f"[W{worker_id}] FAILED rc={rc} {url}")
-            _clean_part_files()
+            _clean_part_files(target_dir)
             _mark_failed(item_id, f"rc={rc}\n{tail}")
 
     except Exception as exc:
         log.exception(f"[W{worker_id}] EXCEPTION downloading {url}: {exc}")
-        _clean_part_files()
+        _clean_part_files(target_dir)
         _mark_failed(item_id, str(exc))
 
 
@@ -239,8 +258,8 @@ def _worker(worker_id: int, my_generation: int):
             _shutdown.wait(WORKER_IDLE_SLEEP)
             continue
 
-        item_id, url = result
-        _run_ytdlp(item_id, url, worker_id)
+        item_id, url, cwd = result
+        _run_ytdlp(item_id, url, cwd, worker_id)
 
     log.info(f"Worker {worker_id} exiting (gen={my_generation})")
 
@@ -328,20 +347,25 @@ def _recover_interrupted():
     """On startup, reset any in_progress items back to pending (orphaned from prior run)."""
     with _db_lock:
         with _conn() as c:
+            orphaned_dirs = {
+                r["cwd"] for r in c.execute(
+                    "SELECT DISTINCT cwd FROM queue WHERE status='in_progress'"
+                )
+            }
             cur = c.execute(
                 "UPDATE queue SET status='pending', started_at=NULL, worker_id=NULL "
                 "WHERE status='in_progress'"
             )
             if cur.rowcount:
                 log.warning(f"Recovered {cur.rowcount} interrupted download(s) → pending")
-    _clean_part_files()
+    for cwd in orphaned_dirs:
+        _clean_part_files(_resolve_target_dir(cwd))
 
 
 def main():
     setup_logging()
     log.info("yt-dlp ingest daemon starting")
 
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     init_db()
     _recover_interrupted()
 

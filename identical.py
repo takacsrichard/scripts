@@ -30,9 +30,15 @@ Subcommands:
   verifytar    verify disk files exist in an archive with matching content (tar, zip, 7z)
 
 Supported types: plain files, dirs, .tar[.gz|.bz2|.xz|.zst], .tgz, .zip, .7z
+
+Tar indexing: listing a tar's members requires a full sequential header scan
+(no index in the format itself). After that scan, identical offers to save
+<archive>.identical-index.json next to the archive; if present and still
+matching the archive's size+mtime, it's loaded instead of rescanning.
 """
 
 import hashlib
+import json
 import math
 import os
 import random
@@ -46,6 +52,7 @@ import zipfile
 from pathlib import Path
 
 _CHUNK = 1 << 20  # 1 MiB I/O chunk size
+_tar_scan_cache: dict[str, list[tuple[int, str]]] = {}  # in-process memo, one scan per path per run
 
 
 # ── type detection ─────────────────────────────────────────────────────────────
@@ -78,6 +85,79 @@ def _strip_common_prefix(entries: list[tuple[int, str]]) -> list[tuple[int, str]
     if len(tops) == 1 and '' not in tops:
         pfx = tops.pop() + '/'
         return [(sz, p[len(pfx):]) for sz, p in entries if p.startswith(pfx)]
+    return entries
+
+
+def _tar_index_path(archive: str) -> str:
+    return archive + '.identical-index.json'
+
+
+def _load_tar_index(archive: str, idx_path: str) -> list[tuple[int, str]] | None:
+    if not os.path.isfile(idx_path):
+        return None
+    try:
+        with open(idx_path) as f:
+            data = json.load(f)
+        st = os.stat(archive)
+        if data['size'] != st.st_size or data['mtime'] != int(st.st_mtime):
+            print(f'identical: index {idx_path} is stale (archive changed), rescanning',
+                  file=sys.stderr)
+            return None
+        return [(sz, name) for sz, name in data['entries']]
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        return None
+
+
+def _save_tar_index(idx_path: str, archive: str, entries: list[tuple[int, str]]) -> None:
+    st = os.stat(archive)
+    data = {
+        'archive': os.path.basename(archive),
+        'size': st.st_size,
+        'mtime': int(st.st_mtime),
+        'entries': [[sz, name] for sz, name in entries],
+    }
+    tmp = idx_path + f'.tmp{os.getpid()}'
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(data, f)
+        os.replace(tmp, idx_path)
+    except OSError as e:
+        print(f'identical: could not write index {idx_path}: {e}', file=sys.stderr)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _scan_tar(path: str) -> list[tuple[int, str]]:
+    """Return [(size, raw_internal_path), ...] for file members, using/offering a sidecar index."""
+    if path in _tar_scan_cache:
+        return _tar_scan_cache[path]
+
+    idx_path = _tar_index_path(path)
+    cached = _load_tar_index(path, idx_path)
+    if cached is not None:
+        print(f'identical: using cached index {idx_path}', file=sys.stderr)
+        _tar_scan_cache[path] = cached
+        return cached
+
+    print(f'identical: scanning {path} (no valid index found)...', file=sys.stderr)
+    entries: list[tuple[int, str]] = []
+    with tarfile.open(path) as tf:
+        for m in tf.getmembers():
+            if m.isfile():
+                entries.append((m.size, m.name.lstrip('./')))
+    _tar_scan_cache[path] = entries
+
+    if sys.stdin.isatty():
+        try:
+            resp = input(f'identical: save index to {idx_path} for faster future runs? '
+                         f'[y/N] ').strip().lower()
+        except EOFError:
+            resp = 'n'
+        if resp == 'y':
+            _save_tar_index(idx_path, path, entries)
+
     return entries
 
 
@@ -123,10 +203,7 @@ def list_entries(path: str, type_: str) -> list[tuple[int, str]]:
 
     raw: list[tuple[int, str]] = []
     if type_ == 'tar':
-        with tarfile.open(path) as tf:
-            for m in tf.getmembers():
-                if m.isfile():
-                    raw.append((m.size, m.name.lstrip('./')))
+        raw = list(_scan_tar(path))
     elif type_ == 'zip':
         with zipfile.ZipFile(path) as zf:
             for info in zf.infolist():
@@ -148,8 +225,7 @@ def internal_list(path: str, type_: str) -> list[str]:
                 result.append(os.path.relpath(os.path.join(root, name), path))
         return result
     if type_ == 'tar':
-        with tarfile.open(path) as tf:
-            return [m.name.lstrip('./') for m in tf.getmembers() if m.isfile()]
+        return [name for _, name in _scan_tar(path)]
     if type_ == 'zip':
         with zipfile.ZipFile(path) as zf:
             return [i.filename for i in zf.infolist() if not i.filename.endswith('/')]
@@ -608,10 +684,8 @@ def _subset_entries(path: str, type_: str, quick: bool) -> dict[str, str]:
                     except OSError:
                         pass
         elif type_ == 'tar':
-            with tarfile.open(path) as tf:
-                for m in tf.getmembers():
-                    if m.isfile():
-                        result[m.name.lstrip('./')] = str(m.size)
+            for sz, name in _scan_tar(path):
+                result[name] = str(sz)
     else:
         if type_ == 'dir':
             for root, _, files in os.walk(path):

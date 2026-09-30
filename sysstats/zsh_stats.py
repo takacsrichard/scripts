@@ -194,26 +194,70 @@ def sec_hdr(title):
     print(f"\n── {title} {'─' * pad}")
 
 
-def print_top(title, counter, total, key_fn=str):
-    sec_hdr(title)
-    print(f"  {'#':>3}  {'command':<46}  {'cnt':>5}  {'%':>6}")
-    print(f"  {'─'*3}  {'─'*46}  {'─'*5}  {'─'*6}")
-    for rank, (item, cnt) in enumerate(counter.most_common(TOP_N), 1):
-        pct = cnt / total * 100
-        label = trunc(key_fn(item))
-        print(f"  {rank:>3}  {label:<46}  {cnt:>5}  {pct:>5.1f}%")
+def _blank_row(w):
+    return " " * (3 + 2 + w + 2 + 5 + 2 + 6)
 
 
-def print_top_chains(title, counter, total):
+def _fmt_row(rank, label, cnt, total, w):
+    pct = cnt / total * 100 if total else 0.0
+    return f"{rank:>3}  {label:<{w}}  {cnt:>5}  {pct:>5.1f}%"
+
+
+def print_top(title, counter, total, counter_2w, total_2w, key_fn=str):
+    """Two independent top-N rankings side by side: all-time vs last 2 weeks."""
     sec_hdr(title)
-    print(f"  {'#':>3}  {'A → B':<95}  {'cnt':>5}  {'%':>6}")
-    print(f"  {'─'*3}  {'─'*95}  {'─'*5}  {'─'*6}")
-    for rank, ((a, b), cnt) in enumerate(counter.most_common(TOP_N), 1):
-        pct = cnt / total * 100
-        a_s = trunc(a, 44)
-        b_s = trunc(b, 44)
-        label = f"{a_s}  →  {b_s}"
-        print(f"  {rank:>3}  {label:<95}  {cnt:>5}  {pct:>5.1f}%")
+    w = 17
+    block = 3 + 2 + w + 2 + 5 + 2 + 6
+    print(f"  {'ALL-TIME'.center(block)}   │  {'LAST 2 WEEKS'.center(block)}")
+    print(f"  {'#':>3}  {'command':<{w}}  {'cnt':>5}  {'%':>6}   │  "
+          f"{'#':>3}  {'command':<{w}}  {'cnt':>5}  {'%':>6}")
+    print(f"  {'─'*3}  {'─'*w}  {'─'*5}  {'─'*6}   │  {'─'*3}  {'─'*w}  {'─'*5}  {'─'*6}")
+
+    all_top = counter.most_common(TOP_N)
+    two_top = counter_2w.most_common(TOP_N)
+    for i in range(max(len(all_top), len(two_top))):
+        if i < len(all_top):
+            item, cnt = all_top[i]
+            left = _fmt_row(i + 1, trunc(key_fn(item), w - 1), cnt, total, w)
+        else:
+            left = _blank_row(w)
+        if i < len(two_top):
+            item, cnt = two_top[i]
+            right = _fmt_row(i + 1, trunc(key_fn(item), w - 1), cnt, total_2w, w)
+        else:
+            right = _blank_row(w)
+        print(f"  {left}   │  {right}")
+
+
+def print_top_chains(title, counter, total, counter_2w, total_2w):
+    """Two independent top-N chain rankings side by side: all-time vs last 2 weeks."""
+    sec_hdr(title)
+    hw = 15  # half-width per side of the A → B label
+    w  = hw * 2 + 3  # "A → B" combined label width
+    block = 3 + 2 + w + 2 + 5 + 2 + 6
+    print(f"  {'ALL-TIME'.center(block)}   │  {'LAST 2 WEEKS'.center(block)}")
+    print(f"  {'#':>3}  {'A → B':<{w}}  {'cnt':>5}  {'%':>6}   │  "
+          f"{'#':>3}  {'A → B':<{w}}  {'cnt':>5}  {'%':>6}")
+    print(f"  {'─'*3}  {'─'*w}  {'─'*5}  {'─'*6}   │  {'─'*3}  {'─'*w}  {'─'*5}  {'─'*6}")
+
+    def chain_label(pair):
+        a, b = pair
+        return f"{trunc(a, hw - 1)} → {trunc(b, hw - 1)}"
+
+    all_top = counter.most_common(TOP_N)
+    two_top = counter_2w.most_common(TOP_N)
+    for i in range(max(len(all_top), len(two_top))):
+        if i < len(all_top):
+            pair, cnt = all_top[i]
+            left = _fmt_row(i + 1, chain_label(pair), cnt, total, w)
+        else:
+            left = _blank_row(w)
+        if i < len(two_top):
+            pair, cnt = two_top[i]
+            right = _fmt_row(i + 1, chain_label(pair), cnt, total_2w, w)
+        else:
+            right = _blank_row(w)
+        print(f"  {left}   │  {right}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -305,15 +349,50 @@ def trend_col(key):
     return f"{arrow}{capped:+.0f}%".ljust(7)
 
 
+# ── Last-2-weeks windows (for the "2w" columns in the top tables) ─────────────
+
+timestamped = parse_timestamps(HISTORY)
+ts_total    = len(timestamped)
+time_ctr    = Counter(time_block(ts) for ts, _ in timestamped)
+
+_now    = datetime.now().timestamp()
+_cut_2w = _now - 14 * 86400
+_win_2w = [(ts, e) for ts, e in timestamped if ts >= _cut_2w]
+
+base_ctr_2w       = Counter()
+full_ctr_2w       = Counter()
+base_chain_ctr_2w = Counter()
+full_chain_ctr_2w = Counter()
+
+_prev_base_2w = None
+_prev_full_2w = None
+for _, e in _win_2w:
+    b = base_of(e)
+    if b:
+        base_ctr_2w[b] += 1
+    full_ctr_2w[e] += 1
+    if _prev_base_2w and b:
+        base_chain_ctr_2w[(_prev_base_2w, b)] += 1
+    if _prev_full_2w is not None:
+        full_chain_ctr_2w[(_prev_full_2w, e)] += 1
+    _prev_base_2w = b
+    _prev_full_2w = e
+
+base_2w_tot       = sum(base_ctr_2w.values())
+full_2w_tot       = sum(full_ctr_2w.values())
+base_chain_2w_tot = sum(base_chain_ctr_2w.values())
+full_chain_2w_tot = sum(full_chain_ctr_2w.values())
+
+
 # ── Output ────────────────────────────────────────────────────────────────────
 
 print(f"\n── ZSH History  {HISTORY}  {'─' * max(0, 38 - len(str(HISTORY)))}")
 print(f"  Total entries : {n:,}")
 
-print_top("TOP 10 — BASE COMMAND", base_ctr, n)
-print_top_chains("TOP 10 — BASE COMMAND CHAINS  (A → B)", base_chain_ctr, n - 1)
-print_top("TOP 10 — FULL COMMAND (with args)", full_ctr, n)
-print_top_chains("TOP 10 — FULL COMMAND CHAINS  (A → B)", full_chain_ctr, n - 1)
+print_top("TOP 10 — BASE COMMAND", base_ctr, n, base_ctr_2w, base_2w_tot)
+print_top_chains("TOP 10 — BASE COMMAND CHAINS  (A → B)", base_chain_ctr, n - 1, base_chain_ctr_2w, base_chain_2w_tot)
+print_top("TOP 10 — FULL COMMAND (with args)", full_ctr, n, full_ctr_2w, full_2w_tot)
+print_top_chains("TOP 10 — FULL COMMAND CHAINS  (A → B)", full_chain_ctr, n - 1, full_chain_ctr_2w, full_chain_2w_tot)
 
 sec_hdr("PIPE & CHAIN BREAKDOWN")
 print(f"  {'metric':<40}  {'count':>6}  {'%':>6}")
@@ -331,15 +410,10 @@ if has_and:
     print(f"  Avg && per &&-entry      : {avg_a:.2f}  (total &&:    {ands_total})")
 print()
 
-timestamped = parse_timestamps(HISTORY)
-ts_total    = len(timestamped)
-time_ctr    = Counter(time_block(ts) for ts, _ in timestamped)
-
-_now     = datetime.now().timestamp()
-_w2      = _now - 14 * 86400
-_w4      = _now - 28 * 86400
-_ts_cur  = [(ts, e) for ts, e in timestamped if ts >= _w2]
-_ts_prev = [(ts, e) for ts, e in timestamped if _w4 <= ts < _w2]
+_cut_cur  = _now - 7 * 86400
+_cut_prev = _now - 14 * 86400
+_ts_cur  = [(ts, e) for ts, e in timestamped if ts >= _cut_cur]
+_ts_prev = [(ts, e) for ts, e in timestamped if _cut_prev <= ts < _cut_cur]
 
 def _ts_cats(window):
     ctr = Counter()
@@ -370,26 +444,33 @@ for key in sorted(all_keys, key=lambda k: cat_ctr.get(k, 0), reverse=True):
 print()
 
 no_prev = _tc_prev_tot == 0
-prev_hdr = "prev 2w*" if no_prev else " prev 2w"
-sec_hdr(f"COMMAND CATEGORIES  (last 2w={_tc_cur_tot} cmds  vs  prev 2w={'N/A' if no_prev else _tc_prev_tot})")
-print(f"  {'category':<28}  {'last 2w':>7}  {prev_hdr:>8}  {'delta':>7}")
-print(f"  {'─'*28}  {'─'*7}  {'─'*8}  {'─'*7}")
+prev_hdr = "prev 7d*" if no_prev else "prev 7d"
+sec_hdr(f"COMMAND CATEGORIES  (last 7d={_tc_cur_tot} cmds  vs  prev 7d={'N/A' if no_prev else _tc_prev_tot})")
+print(f"  {'category':<28}  {'last 7d':>8}  {prev_hdr:>8}  {'delta':>8}")
+print(f"  {'─'*28}  {'─'*8}  {'─'*8}  {'─'*8}")
 seen = set(_tc_cur) | set(_tc_prev)
 for key in sorted(seen, key=lambda k: _tc_cur.get(k, 0), reverse=True):
     c = _tc_cur.get(key, 0)
     p = _tc_prev.get(key, 0)
     if c == 0 and p == 0:
         continue
-    lbl = CATEGORIES[key][0] if key in CATEGORIES else "Uncategorized"
-    ps  = "     N/A" if no_prev else f"{p:>8}"
-    ds  = "     N/A" if no_prev else f"{c - p:>+7}"
-    print(f"  {lbl:<28}  {c:>7}  {ps}  {ds}")
-print(f"  {'─'*28}  {'─'*7}  {'─'*8}  {'─'*7}")
+    lbl   = CATEGORIES[key][0] if key in CATEGORIES else "Uncategorized"
+    c_pct = c / _tc_cur_tot * 100 if _tc_cur_tot else 0.0
+    cs    = f"{c_pct:.1f}%"
+    if no_prev:
+        ps = "N/A"
+        ds = "N/A"
+    else:
+        p_pct = p / _tc_prev_tot * 100 if _tc_prev_tot else 0.0
+        ps = f"{p_pct:.1f}%"
+        ds = f"{(c_pct - p_pct)*(-1):+.1f}%"
+    print(f"  {lbl:<28}  {cs:>8}  {ps:>8}  {ds:>8}")
+print(f"  {'─'*28}  {'─'*8}  {'─'*8}  {'─'*8}")
 if no_prev:
-    print(f"  {'TOTAL':<28}  {_tc_cur_tot:>7}  {'     N/A'}  {'    N/A'}")
-    print(f"  (* prev 2w has no data yet — need {14 - int((_now - min((ts for ts, _ in timestamped), default=_now)) / 86400)} more days of history)")
+    print(f"  {'TOTAL':<28}  {'100.0%':>8}  {'N/A':>8}  {'N/A':>8}")
+    print(f"  (* prev 7d has no data yet — need {7 - int((_now - min((ts for ts, _ in timestamped), default=_now)) / 86400)} more days of history)")
 else:
-    print(f"  {'TOTAL':<28}  {_tc_cur_tot:>7}  {_tc_prev_tot:>8}  {_tc_cur_tot - _tc_prev_tot:>+7}")
+    print(f"  {'TOTAL':<28}  {'100.0%':>8}  {'100.0%':>8}  {'+0.0%':>8}")
 print()
 
 if ts_total == 0:

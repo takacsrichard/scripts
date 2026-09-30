@@ -60,6 +60,7 @@ def cmd_add(urls: list[str]):
     if not urls:
         print("No URLs provided.")
         return
+    cwd = os.getcwd()
     c = _conn()
     added = skipped = rejected = 0
     for url in urls:
@@ -68,7 +69,7 @@ def cmd_add(urls: list[str]):
             rejected += 1
             continue
         try:
-            c.execute("INSERT INTO queue (url) VALUES (?)", (url,))
+            c.execute("INSERT INTO queue (url, cwd) VALUES (?, ?)", (url, cwd))
             added += 1
         except sqlite3.IntegrityError:
             skipped += 1

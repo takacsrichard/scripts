@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Init a local dir and push to gitlab as takacsrichard/<name>
+# Init a local dir and push to github as takacsrichard/<name>
 # Usage: ginit -n <repo_name> [-c "commit message"] [-p (public)]
 set -uo pipefail
 
@@ -23,7 +23,7 @@ if [[ -z "$repo_name" ]]; then
 fi
 
 current_dir="$PWD"
-read -rp "Push '${current_dir}' to gitlab:takacsrichard/${repo_name}.git? [y/N] " confirm </dev/tty
+read -rp "Push '${current_dir}' to github:takacsrichard/${repo_name}.git? [y/N] " confirm </dev/tty
 if [[ "$confirm" != [Yy] ]]; then
     echo "Aborted."
     exit 1
@@ -40,7 +40,7 @@ fi
 
 git init
 
-remote_url="git@gitlab.com:takacsrichard/${repo_name}.git"
+remote_url="git@github.com:takacsrichard/${repo_name}.git"
 if git remote get-url origin &>/dev/null; then
     git remote set-url origin "$remote_url"
 else
@@ -52,9 +52,9 @@ git add .
 echo ""
 git status
 echo ""
-read -rp "Commit and push the above to gitlab:takacsrichard/${repo_name}.git? [y/N] " proceed </dev/tty
+read -rp "Commit and push the above to github:takacsrichard/${repo_name}.git? [y/N] " proceed </dev/tty
 if [[ "$proceed" != [Yy] ]]; then
-    echo "Aborted. Remote is set to: git@gitlab.com:takacsrichard/${repo_name}.git"
+    echo "Aborted. Remote is set to: git@github.com:takacsrichard/${repo_name}.git"
     echo "Files are staged but not committed — re-run ginit when ready."
     git reset HEAD -- . &>/dev/null
     exit 1
@@ -65,24 +65,27 @@ if ! git diff --cached --quiet; then
     git commit -m "$commit_msg"
 fi
 
-# Create the GitLab repo via API before pushing so git push doesn't hang
+# Create the GitHub repo via API before pushing so git push doesn't hang
 # waiting for a non-existent remote. Token fetched from rbw (Bitwarden).
-gl_token="$(rbw get "gitlab stuff personal access token" 2>/dev/null)"
-if [[ -z "$gl_token" ]]; then
-    echo "ginit: warning: could not fetch GitLab token from rbw — skipping remote repo creation." >&2
-    echo "  If the repo doesn't exist on GitLab, the push will fail. Create it manually first." >&2
+gh_token="$(rbw get "github stuff personal access token" 2>/dev/null)"
+if [[ -z "$gh_token" ]]; then
+    echo "ginit: warning: could not fetch GitHub token from rbw — skipping remote repo creation." >&2
+    echo "  If the repo doesn't exist on GitHub, the push will fail. Create it manually first." >&2
 else
-    api_resp=$(curl -sfS --max-time 15 \
+    private_flag="true"
+    [[ "$visibility" == "public" ]] && private_flag="false"
+    api_resp=$(curl -sS --max-time 15 \
         --write-out '\n%{http_code}' \
-        --header "PRIVATE-TOKEN: $gl_token" \
+        --header "Authorization: token $gh_token" \
+        --header "Accept: application/vnd.github+json" \
         --header "Content-Type: application/json" \
-        --data "{\"name\":\"${repo_name}\",\"visibility\":\"${visibility}\",\"initialize_with_readme\":false}" \
-        "https://gitlab.com/api/v4/projects" 2>&1)
+        --data "{\"name\":\"${repo_name}\",\"private\":${private_flag}}" \
+        "https://api.github.com/user/repos" 2>&1)
     http_code="${api_resp##*$'\n'}"
     case "$http_code" in
-        201) echo "  → GitLab repo created (${visibility}): https://gitlab.com/takacsrichard/${repo_name}" ;;
-        400) echo "  → GitLab repo already exists, skipping creation." ;;
-        *)   echo "ginit: GitLab API returned HTTP ${http_code} — continuing anyway." >&2 ;;
+        201) echo "  → GitHub repo created (${visibility}): https://github.com/takacsrichard/${repo_name}" ;;
+        422) echo "  → GitHub repo already exists, skipping creation." ;;
+        *)   echo "ginit: GitHub API returned HTTP ${http_code} — continuing anyway." >&2 ;;
     esac
 fi
 
